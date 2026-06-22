@@ -18,7 +18,61 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+# Letter sizes we recognize as standalone tokens (e.g. "in M") when there's no
+# explicit "size ..." phrase. Numeric sizes are only read from "size N".
+_SIZE_WORDS = {"xxs", "xs", "s", "m", "l", "xl", "xxl", "xxxl"}
+
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract a description, size, and max_price from a natural language query
+    using regex/string rules (no LLM — deterministic and free).
+
+    Examples:
+        "vintage graphic tee under $30"     -> desc="vintage graphic tee", max_price=30.0
+        "90s track jacket in size M"        -> desc="90s track jacket", size="M"
+        "designer ballgown size XXS under $5" -> desc="designer ballgown", size="XXS", max_price=5.0
+
+    The matched price/size phrases are stripped out of the description so they
+    don't pollute keyword scoring in search_listings.
+    """
+    q = query
+    max_price = None
+    size = None
+
+    # Price: "under $30" / "below 40" / "less than $5" / a bare "$5".
+    m = re.search(
+        r"(?:under|below|less than|cheaper than|max|<)\s*\$?\s*(\d+(?:\.\d+)?)",
+        q, re.IGNORECASE,
+    )
+    if m is None:
+        m = re.search(r"\$\s*(\d+(?:\.\d+)?)", q)
+    if m is not None:
+        max_price = float(m.group(1))
+        q = q[:m.start()] + " " + q[m.end():]
+
+    # Size: explicit "size X" (letters, digits, or things like "S/M").
+    ms = re.search(r"\bsize\s+([A-Za-z0-9]+(?:/[A-Za-z0-9]+)?)", q, re.IGNORECASE)
+    if ms is not None:
+        size = ms.group(1)
+        q = q[:ms.start()] + " " + q[ms.end():]
+    else:
+        # Fallback: a standalone letter-size token like "in M".
+        for tok in re.findall(r"[A-Za-z]+", q):
+            if tok.lower() in _SIZE_WORDS:
+                size = tok
+                q = re.sub(rf"\b{re.escape(tok)}\b", " ", q, count=1)
+                break
+
+    description = re.sub(r"\s+", " ", q).strip(" ,.")
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +146,41 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: fresh session — the single source of truth for this interaction.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the query into search parameters.
+    session["parsed"] = _parse_query(query)
+    parsed = session["parsed"]
+
+    # Step 3: search the listings.
+    session["search_results"] = search_listings(
+        description=parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+    if not session["search_results"]:
+        # No matches — set a helpful error and exit before the LLM tools.
+        session["error"] = (
+            f"No listings matched “{query}”. "
+            "Try loosening the size or raising the price."
+        )
+        return session
+
+    # Step 4: select the top-ranked result.
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 5: suggest an outfit pairing it with the user's wardrobe.
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], wardrobe
+    )
+
+    # Step 6: turn the outfit into a shareable fit card.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: return the completed session.
     return session
 
 

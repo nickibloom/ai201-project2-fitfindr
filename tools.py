@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -21,8 +22,18 @@ from utils.data_loader import load_listings
 
 load_dotenv()
 
+# Common words that carry no search signal — stripped before keyword scoring so
+# a query like "looking for a vintage tee" scores on "vintage"/"tee", not "for"/"a".
+_STOPWORDS = {
+    "a", "an", "the", "for", "with", "and", "or", "in", "of", "to", "my",
+    "im", "i", "looking", "want", "need", "some", "something", "size", "under",
+}
+
 
 # ── Groq client ───────────────────────────────────────────────────────────────
+
+_GROQ_MODEL = "llama-3.3-70b-versatile"
+
 
 def _get_groq_client():
     """Initialize and return a Groq client using GROQ_API_KEY from .env."""
@@ -34,7 +45,53 @@ def _get_groq_client():
     return Groq(api_key=api_key)
 
 
+def _chat(system: str, user: str, temperature: float = 0.7) -> str:
+    """
+    Send a single system+user prompt to the Groq chat model and return the
+    response text. Shared by suggest_outfit and create_fit_card.
+    """
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=_GROQ_MODEL,
+        temperature=temperature,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _describe_item(item: dict) -> str:
+    """Compact one-line description of a listing for use inside a prompt."""
+    parts = [item["title"]]
+    if item.get("brand"):
+        parts.append(f"by {item['brand']}")
+    parts.append(f"({item['category']}, size {item['size']}, {item['condition']} condition)")
+    parts.append(f"— {', '.join(item['colors'])}; tags: {', '.join(item['style_tags'])}")
+    return " ".join(parts)
+
+
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
+
+def _size_matches(wanted: str, listing_size: str) -> bool:
+    """
+    Token-based size match. Splits the listing size on spaces, slashes, and
+    parens so "M" matches "S/M" and "XL" matches "XL (oversized)", while a
+    numeric size like "8" does NOT spuriously match "W28". A numeric size also
+    matches its half size ("8" matches "8.5") since those run small/large enough
+    to be worth surfacing.
+    """
+    wanted = wanted.strip().lower()
+    tokens = [t for t in re.split(r"[\s/()]+", listing_size.lower()) if t]
+    if wanted in tokens:
+        return True
+    # Half-size leniency for numeric sizes: "8" matches "8.5" but not "28".
+    if wanted.isdigit():
+        return any(t.startswith(wanted + ".") for t in tokens)
+    return False
+
+
 
 def search_listings(
     description: str,
@@ -69,8 +126,46 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # 1. Filter by hard constraints first (price, then size).
+    candidates = []
+    for item in listings:
+        if max_price is not None and item["price"] > max_price:
+            continue
+        if size is not None and not _size_matches(size, item["size"]):
+            continue
+        candidates.append(item)
+
+    # 2. Tokenize the description into lowercase keywords.
+    keywords = [w for w in re.findall(r"[a-z0-9]+", description.lower()) if w not in _STOPWORDS]
+
+    # 3. Score each candidate by keyword overlap across its searchable text.
+    scored = []
+    for item in candidates:
+        haystack = " ".join([
+            item["title"],
+            item["description"],
+            " ".join(item["style_tags"]),
+            item["category"],
+        ] + item["colors"] + ([item["brand"]] if item.get("brand") else [])).lower()
+
+        score = 0
+        for kw in keywords:
+            # style_tags / category matches are the strongest signal — weight them.
+            if kw in [t.lower() for t in item["style_tags"]] or kw == item["category"].lower():
+                score += 2
+            elif kw in haystack:
+                score += 1
+
+        # 4. Drop anything with no keyword relevance.
+        if score > 0:
+            scored.append((score, item))
+
+    # 5. Sort by score (highest first) and return just the listing dicts.
+    #    Ties keep their original dataset order (Python sort is stable).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +195,44 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_desc = _describe_item(new_item)
+    items = wardrobe.get("items", [])
+
+    if not items:
+        # Empty wardrobe → general styling advice for the item on its own.
+        system = (
+            "You are a friendly secondhand-fashion stylist. The shopper hasn't "
+            "entered their wardrobe yet, so give general styling ideas for a "
+            "single thrifted piece. Suggest what kinds of items pair well with it, "
+            "the vibe/occasions it suits, and a couple of concrete outfit ideas. "
+            "Keep it to a short, encouraging paragraph or two."
+        )
+        user = f"The thrifted piece is: {item_desc}\n\nHow should I style it?"
+        return _chat(system, user, temperature=0.7)
+
+    # Non-empty wardrobe → name specific pieces the shopper already owns.
+    wardrobe_lines = []
+    for w in items:
+        line = f"- {w['name']} ({w['category']}; {', '.join(w.get('colors', []))}; {', '.join(w.get('style_tags', []))})"
+        if w.get("notes"):
+            line += f" — {w['notes']}"
+        wardrobe_lines.append(line)
+    wardrobe_text = "\n".join(wardrobe_lines)
+
+    system = (
+        "You are a friendly secondhand-fashion stylist. Suggest 1–2 complete "
+        "outfits that pair a newly found thrifted item with pieces the shopper "
+        "ALREADY owns. Refer to the owned pieces by their names exactly as listed. "
+        "Only use items from the wardrobe list plus the new piece — do not invent "
+        "items the shopper doesn't have. For each outfit, give it a short vibe "
+        "label and explain in a sentence or two why the pieces work together."
+    )
+    user = (
+        f"New thrifted piece:\n{item_desc}\n\n"
+        f"My wardrobe:\n{wardrobe_text}\n\n"
+        "Suggest 1–2 outfits using the new piece and my wardrobe."
+    )
+    return _chat(system, user, temperature=0.7)
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +264,32 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against missing/empty outfit input.
+    if not outfit or not outfit.strip():
+        return (
+            "Couldn't write a fit card — no outfit suggestion was provided. "
+            "Try finding an item and generating an outfit first."
+        )
+
+    name = new_item.get("title", "this piece")
+    price = new_item.get("price")
+    price_str = f"${price:.0f}" if isinstance(price, (int, float)) else "a steal"
+    platform = new_item.get("platform", "secondhand")
+
+    system = (
+        "You write short, shareable OOTD captions for thrifted fashion finds — "
+        "the kind of authentic, slightly playful caption a real person posts on "
+        "Instagram or TikTok. Write 2–4 sentences. Mention the item name, its "
+        "price, and the platform it's from naturally, each exactly once. Capture "
+        "the specific vibe of the outfit. Sound human, not like a product listing. "
+        "Light emoji are fine. Return only the caption text."
+    )
+    user = (
+        f"Item: {name}\n"
+        f"Price: {price_str}\n"
+        f"Platform: {platform}\n\n"
+        f"The outfit it's styled in:\n{outfit}\n\n"
+        "Write the fit card caption."
+    )
+    # Higher temperature so captions vary across different finds.
+    return _chat(system, user, temperature=1.0)

@@ -43,8 +43,42 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    # 1. Guard against an empty query.
+    if not user_query or not user_query.strip():
+        return "Please describe what you're looking for.", "", ""
+
+    # 2. Select the wardrobe.
+    if wardrobe_choice == "Empty wardrobe (new user)":
+        wardrobe = get_empty_wardrobe()
+    else:
+        wardrobe = get_example_wardrobe()
+
+    # 3. Run the agent.
+    session = run_agent(user_query, wardrobe)
+
+    # 4. Early-exit path: surface the error in the first panel only.
+    if session["error"]:
+        return session["error"], "", ""
+
+    # 5. Success path: format the chosen listing and return all three panels.
+    listing_text = _format_listing(session["selected_item"])
+    return listing_text, session["outfit_suggestion"], session["fit_card"]
+
+
+def _format_listing(item: dict) -> str:
+    """Render a listing dict as readable multi-line text for the UI panel."""
+    lines = [
+        item["title"],
+        f"${item['price']:.2f} · {item['platform']}",
+        f"Size {item['size']} · {item['condition']} condition",
+    ]
+    if item.get("brand"):
+        lines.append(f"Brand: {item['brand']}")
+    lines.append(f"Colors: {', '.join(item['colors'])}")
+    lines.append(f"Style: {', '.join(item['style_tags'])}")
+    lines.append("")
+    lines.append(item["description"])
+    return "\n".join(lines)
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
